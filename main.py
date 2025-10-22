@@ -1,13 +1,14 @@
 import requests
 import time
 import json
-from urllib.parse import quote
+import csv 
+from tenacity import retry, stop_after_attempt, wait_fixed 
 
 
 
-DELAY_SECONDS = 0.1 # задержка между кошельками в секундах
+DELAY_SECONDS = 5.1 # задержка между кошельками в секундах
 
-USE_PROXIES = True
+USE_PROXIES = True  # прокси вкл/выкл
 
 
 
@@ -46,11 +47,12 @@ def build_api_url(address):
     base_url = "https://api.turtle.xyz/turtle/airdrop/claims?wallet_addresses="
     return f"{base_url}{address}"
 
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 def fetch_eligibility_data(url, proxy=None):
     try:
         response = requests.get(url, proxies=proxy, timeout=10)
         response.raise_for_status()
-        return response.json()
+        return json.loads(response.text)
     except requests.exceptions.RequestException as e:
         print(f"Ошибка API: {e}")
         return None
@@ -75,9 +77,18 @@ def parse_eligibility_response(json_data):
         pass
     return is_eligible, amount, category
 
+def write_to_csv(filepath, data):
+    with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
+        csv_writer = csv.writer(csvfile)
+        csv_writer.writerow(["Кошелек", "Количество монет"]) 
+        for address, amount in data:
+            csv_writer.writerow([address, f"{amount:.4f}"])
+    print(f"Результаты сохранены в {filepath}")
+
 if __name__ == "__main__":
     addresses = read_evm_addresses("evm.txt")
     proxies = []
+    results_data = [] 
     
     if USE_PROXIES:
         proxies = read_proxies("proxies.txt")
@@ -87,36 +98,63 @@ if __name__ == "__main__":
             print("Прокси не загружены, использую прямое подключение")
 
     total_tokens = 0.0
+    current_proxy_index = 0 
     
-    with open("result.txt", 'w') as result_f:
+    try:
         if addresses:
             print(f"Начинаю проверку {len(addresses)} адресов...")
-            result_f.write(f"Начинаю проверку {len(addresses)} адресов...\n")
 
             for i, addr in enumerate(addresses):
                 if i > 0:
                     time.sleep(DELAY_SECONDS)
                 
-                proxy = get_next_proxy(proxies, i) if USE_PROXIES else None
-                
-                url = build_api_url(addr)
-                json_data = fetch_eligibility_data(url, proxy)
+                max_proxy_retries = len(proxies) if proxies else 1 
+                attempts = 0
+                json_data = None
+
+                while attempts < max_proxy_retries:
+                    proxy = get_next_proxy(proxies, current_proxy_index) if USE_PROXIES and proxies else None
+                    
+                    try:
+                        url = build_api_url(addr)
+                        json_data = fetch_eligibility_data(url, proxy)
+                        break 
+                    except requests.exceptions.ProxyError as e:
+                        print(f"Ошибка прокси для {addr} с прокси {proxy}: {e}. Меняю прокси...")
+                        current_proxy_index += 1
+                        attempts += 1
+                        if attempts == max_proxy_retries and USE_PROXIES and proxies:
+                            print("Все прокси исчерпаны. Пробую прямое подключение...")
+                            proxy = None 
+                            try:
+                                json_data = fetch_eligibility_data(url, proxy)
+                                break
+                            except requests.exceptions.RequestException as direct_e:
+                                print(f"Ошибка при прямом подключении для {addr}: {direct_e}")
+                                json_data = None
+                        time.sleep(DELAY_SECONDS) 
+                    except requests.exceptions.RequestException as e:
+                        print(f"Ошибка API для {addr}: {e}")
+                        json_data = None
+                        break 
+
                 is_eligible, amount, category = parse_eligibility_response(json_data) if json_data else (False, 0.0, "N/A")
 
                 output_line = ""
                 if is_eligible:
                     output_line = f"{i+1}/{len(addresses)}: {addr} - Eligible - {amount:.4f} ({category})"
                     total_tokens += amount
+                    results_data.append((addr, amount)) 
                 else:
                     output_line = f"{i+1}/{len(addresses)}: {addr} - Not Eligible"
+                    results_data.append((addr, 0.0)) 
                 
                 print(output_line)
-                result_f.write(output_line + '\n')
             
             final_summary = f"\nВсего токенов: {total_tokens:.4f}"
             print(final_summary)
-            result_f.write(final_summary + '\n')
         else:
             no_addresses_msg = "Нет адресов в evm.txt."
             print(no_addresses_msg)
-            result_f.write(no_addresses_msg + '\n')
+    finally:
+        write_to_csv("result.csv", results_data)
